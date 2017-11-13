@@ -3,7 +3,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>nabu</groupId>
 	<artifactId>eai-module-http-reverse-proxy</artifactId>
-	<version>1.0-SNAPSHOT</version>
+	<version>${nabu-eai-module-http-reverse-proxy-version}</version>
 	<name>eai-module-http-reverse-proxy</name>
 	<url>http://nabu.be</url>
 
