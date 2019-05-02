@@ -6,8 +6,8 @@ import javax.validation.constraints.NotNull;
 import javax.xml.bind.annotation.XmlRootElement;
 import javax.xml.bind.annotation.adapters.XmlJavaTypeAdapter;
 
-import be.nabu.eai.module.cluster.ClusterArtifact;
 import be.nabu.eai.module.http.virtual.VirtualHostArtifact;
+import be.nabu.eai.repository.api.cluster.ClusterArtifact;
 import be.nabu.eai.repository.jaxb.ArtifactXMLAdapter;
 
 @XmlRootElement(name = "reverseProxy")

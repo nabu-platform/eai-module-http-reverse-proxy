@@ -3,8 +3,10 @@ package be.nabu.eai.module.http.reverse.proxy;
 import java.io.IOException;
 import java.net.CookieManager;
 import java.net.CookiePolicy;
+import java.net.Inet6Address;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -14,13 +16,15 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import be.nabu.eai.module.cluster.ClusterArtifact;
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.ReverseProxyEntry;
+import be.nabu.eai.repository.EAIRepositoryUtils;
 import be.nabu.eai.repository.RepositoryThreadFactory;
 import be.nabu.eai.repository.api.Repository;
+import be.nabu.eai.repository.api.cluster.Cluster;
 import be.nabu.eai.repository.artifacts.jaxb.JAXBArtifact;
 import be.nabu.libs.artifacts.api.StartableArtifact;
 import be.nabu.libs.artifacts.api.StoppableArtifact;
+import be.nabu.libs.events.api.EventDispatcher;
 import be.nabu.libs.events.api.EventHandler;
 import be.nabu.libs.events.api.EventSubscription;
 import be.nabu.libs.events.impl.EventDispatcherImpl;
@@ -29,6 +33,7 @@ import be.nabu.libs.http.api.HTTPRequest;
 import be.nabu.libs.http.api.HTTPResponse;
 import be.nabu.libs.http.client.nio.NIOHTTPClientImpl;
 import be.nabu.libs.http.core.CustomCookieStore;
+import be.nabu.libs.http.core.HTTPUtils;
 import be.nabu.libs.http.core.ServerHeader;
 import be.nabu.libs.http.server.nio.MemoryMessageDataProvider;
 import be.nabu.libs.nio.PipelineUtils;
@@ -38,6 +43,10 @@ import be.nabu.libs.nio.api.events.ConnectionEvent.ConnectionState;
 import be.nabu.libs.nio.impl.MessagePipelineImpl;
 import be.nabu.libs.nio.impl.NIOFixedConnector;
 import be.nabu.libs.resources.api.ResourceContainer;
+import be.nabu.libs.services.api.ServiceException;
+import be.nabu.libs.validator.api.ValidationMessage.Severity;
+import be.nabu.utils.cep.api.EventSeverity;
+import be.nabu.utils.cep.impl.HTTPComplexEventImpl;
 import be.nabu.utils.io.IOUtils;
 import be.nabu.utils.io.api.ByteBuffer;
 import be.nabu.utils.io.api.ReadableContainer;
@@ -50,7 +59,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 
 	private static final String REVERSE_PROXY_CLIENT = "reverseProxyClient";
 	private Map<String, String> hostMapping = new HashMap<String, String>();
-	private Map<ClusterArtifact, Integer> roundRobin = new HashMap<ClusterArtifact, Integer>();
+	private Map<Cluster, Integer> roundRobin = new HashMap<Cluster, Integer>();
 	private List<EventSubscription<?, ?>> subscriptions = new ArrayList<EventSubscription<?, ?>>();
 	private Logger logger = LoggerFactory.getLogger(getClass());
 	
@@ -72,7 +81,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		// this can prevent the need for jwt-based sessions
 		if (getConfig().getEntries() != null) {
 			for (final ReverseProxyEntry entry : getConfig().getEntries()) {
-				if (entry.getHost() != null && entry.getCluster() != null && entry.getCluster().getConfig().getHosts() != null && !entry.getCluster().getConfig().getHosts().isEmpty()) {
+				if (entry.getHost() != null && entry.getCluster() != null && !entry.getCluster().getMembers().isEmpty()) {
 					
 					// make sure we listen to disconnects from the server so we can close outstanding clients
 					entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
@@ -95,6 +104,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 						}
 					});
 					
+					final EventDispatcher dispatcher = getRepository().getComplexEventDispatcher();
+					
 					EventSubscription<HTTPRequest, HTTPResponse> subscription = entry.getHost().getDispatcher().subscribe(HTTPRequest.class, new EventHandler<HTTPRequest, HTTPResponse>() {
 						@Override
 						public HTTPResponse handle(HTTPRequest event) {
@@ -103,19 +114,25 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 
 						private HTTPResponse handle(final ReverseProxyEntry entry, HTTPRequest event, int attempt) {
 							final Pipeline pipeline = PipelineUtils.getPipeline();
+
+							HTTPComplexEventImpl request = null;
+							String remoteHost = null;
+							
 							NIOHTTPClientImpl client = (NIOHTTPClientImpl) pipeline.getContext().get(REVERSE_PROXY_CLIENT);
 							if (client == null) {
-								InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
-								String remoteHost = socketAddress.getHostString();
+								if (remoteHost == null) {
+									InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
+									remoteHost = socketAddress.getHostString();
+								}
 								if (!hostMapping.containsKey(remoteHost)) {
 									synchronized(hostMapping) {
 										if (!hostMapping.containsKey(remoteHost)) {
 											int robin = roundRobin.containsKey(entry.getCluster()) ? roundRobin.get(entry.getCluster()) : -1;
 											robin++;
-											if (robin >= entry.getCluster().getConfig().getHosts().size()) {
+											if (robin >= entry.getCluster().getMembers().size()) {
 												robin = 0;
 											}
-											hostMapping.put(remoteHost, entry.getCluster().getConfig().getHosts().get(robin));
+											hostMapping.put(remoteHost, entry.getCluster().getMembers().get(robin).getAddress().getHostString() + ":" + entry.getCluster().getMembers().get(robin).getAddress().getPort());
 											roundRobin.put(entry.getCluster(), robin);
 										}
 									}
@@ -147,10 +164,60 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								}
 								client.getNIOClient().setConnector(new NIOFixedConnector(host, port));
 							}
+							
+							if (dispatcher != null) {
+								request = new HTTPComplexEventImpl();
+								request.setArtifactId(getId());
+								request.setEventName("reverse-proxy-request");
+								request.setEventCategory("reverse-proxy");
+								request.setEventCount(attempt + 1);
+								request.setMethod(event.getMethod());
+								Header header = MimeUtils.getHeader("User-Agent", event.getContent().getHeaders());
+								if (header != null) {
+									request.setUserAgent(MimeUtils.getFullHeaderValue(header));
+								}
+								
+								InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
+								if (remoteHost == null) {
+									remoteHost = socketAddress.getHostString();
+								}
+								request.setSourceHost(socketAddress.getHostName());
+								request.setSourceIp(socketAddress.getAddress().getHostAddress());
+								request.setSourcePort(socketAddress.getPort());
+								if (socketAddress.getAddress() instanceof Inet6Address) {
+									request.setNetworkProtocol("ipv6");
+								}
+								else {
+									request.setNetworkProtocol("ipv4");
+								}
+								
+								String host = hostMapping.get(remoteHost);
+								int indexOf = host.indexOf(':');
+								Integer port = null;
+								if (indexOf > 0) {
+									port = Integer.parseInt(host.substring(indexOf + 1));
+									host = host.substring(0, indexOf);
+								}
+								request.setDestinationHost(host);
+								request.setDestinationPort(port);
+								request.setTransportProtocol("TCP");
+								request.setApplicationProtocol(entry.getHost().getConfig().getServer().isSecure() ? "HTTPS" : "HTTP");
+								request.setSizeIn(MimeUtils.getContentLength(event.getContent().getHeaders()));
+								request.setStarted(new Date());
+							}
 							try {
 								Future<HTTPResponse> call = client.call(event, false);
 								long timeout = getConfig().getTimeout() != null ? getConfig().getTimeout() : 30 * 60000;
 								HTTPResponse httpResponse = call.get(timeout, TimeUnit.MILLISECONDS);
+								
+								if (request != null) {
+									request.setRequestUri(HTTPUtils.getURI(event, entry.getHost().getConfig().getServer().isSecure()));
+									request.setStopped(new Date());
+									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
+									request.setSeverity(httpResponse.getCode() >= 403 ? EventSeverity.WARNING : EventSeverity.INFO);
+									request.setResponseCode(httpResponse.getCode());
+									dispatcher.fire(request, ReverseProxy.this);
+								}
 								// remove internal headers
 								for (ServerHeader header : ServerHeader.values()) {
 									httpResponse.getContent().removeHeader(header.getName());
@@ -163,6 +230,13 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								return httpResponse;
 							}
 							catch (Exception e) {
+								if (request != null) {
+									request.setStopped(new Date());
+									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
+									request.setSeverity(EventSeverity.ERROR);
+									EAIRepositoryUtils.enrich(request, e);
+									dispatcher.fire(request, ReverseProxy.this);
+								}
 								try {
 									client.close();
 								}
@@ -171,9 +245,13 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								}
 								pipeline.getContext().remove(REVERSE_PROXY_CLIENT);
 								if (attempt < 2) {
-									InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
-									String remoteHost = socketAddress.getHostString();
-									hostMapping.remove(remoteHost);
+									if (remoteHost == null) {
+										InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
+										remoteHost = socketAddress.getHostString();
+									}
+									synchronized(hostMapping) {
+										hostMapping.remove(remoteHost);
+									}
 									return handle(entry, event, attempt + 1);
 								}
 								else {
@@ -192,6 +270,5 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	public boolean isStarted() {
 		return !subscriptions.isEmpty();
 	}
-
 	
 }
