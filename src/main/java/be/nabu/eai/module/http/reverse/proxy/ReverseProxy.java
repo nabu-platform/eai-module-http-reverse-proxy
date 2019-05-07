@@ -81,7 +81,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		// this can prevent the need for jwt-based sessions
 		if (getConfig().getEntries() != null) {
 			for (final ReverseProxyEntry entry : getConfig().getEntries()) {
-				if (entry.getHost() != null && entry.getCluster() != null && !entry.getCluster().getMembers().isEmpty()) {
+				if (entry.getHost() != null && entry.getCluster() != null) {
 					
 					// make sure we listen to disconnects from the server so we can close outstanding clients
 					entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
