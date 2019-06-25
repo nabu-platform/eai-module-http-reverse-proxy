@@ -1,5 +1,6 @@
 package be.nabu.eai.module.http.reverse.proxy;
 
+import java.net.URI;
 import java.util.List;
 
 import javax.validation.constraints.NotNull;
@@ -33,6 +34,7 @@ public class ReverseProxyConfiguration {
 	public static class ReverseProxyEntry {
 		private VirtualHostArtifact host;
 		private ClusterArtifact cluster;
+		private List<DowntimePage> downtimePages;
 	
 		@NotNull
 		@XmlJavaTypeAdapter(value = ArtifactXMLAdapter.class)
@@ -50,6 +52,30 @@ public class ReverseProxyConfiguration {
 		}
 		public void setCluster(ClusterArtifact cluster) {
 			this.cluster = cluster;
+		}
+		
+		public List<DowntimePage> getDowntimePages() {
+			return downtimePages;
+		}
+		public void setDowntimePages(List<DowntimePage> downtimePages) {
+			this.downtimePages = downtimePages;
+		}
+	}
+	
+	public static class DowntimePage {
+		private URI uri;
+		private String language;
+		public URI getUri() {
+			return uri;
+		}
+		public void setUri(URI uri) {
+			this.uri = uri;
+		}
+		public String getLanguage() {
+			return language;
+		}
+		public void setLanguage(String language) {
+			this.language = language;
 		}
 	}
 }

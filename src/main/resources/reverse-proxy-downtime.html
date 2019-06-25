@@ -1,0 +1,154 @@
+<html>
+	<head>
+		<style>
+			/**
+ * Main CSS files
+ */
+
+
+html {
+	font-family: "Open Sans", sans-serif;
+	font-size: 16px;
+}
+
+html, body {
+	height: 100%;
+	margin: 0;
+	padding: 0;
+	width: 100%;
+}
+
+*, *:before, *:after {
+	box-sizing: border-box;
+}
+
+
+main {
+	background-color: #eaebed;
+	height: 100%;
+	position: relative;
+	width: 100%;
+	display: block;
+}
+
+main .container {
+	background-color: #fff;
+	border-radius: 5px;
+	box-shadow: 0 0 2px 2px rgba(0,0,0,0.05);
+	padding: 3rem;
+	position: absolute;
+	top: 50%;
+	left: 50%;
+	transform: translate(-50%,-50%);
+	width: calc(100% - 6rem);
+	max-width: 32em;
+}
+
+main .container form {
+	padding: 1.5rem;
+}
+main .container form label {
+	display: block;
+}
+main .container form label input {
+	border: none;
+	border-bottom: 1px solid #bababa;
+	box-shadow: none;
+	color: #333;
+	font-size: 1rem;
+	line-height: 2rem;
+	margin: 0 0 1rem;
+	padding: 0 0.375rem;
+	outline: none;
+	width: 100%;
+}
+main .container form label input:focus {
+	border-bottom: 1px solid #5295bb;
+}
+main input::-webkit-input-placeholder {
+	color: #999;
+	font-weight: 300;
+	font-size: 0.9rem;
+}
+main input::-moz-placeholder {
+	color: #999;
+	font-weight: 300;
+	font-size: 0.9rem;
+}
+
+main .container form .submit {
+	background-color: #5295bb;
+	border: none;
+	border-radius: 3px;
+	box-shadow: none;
+	color: #fafafa;
+	cursor: pointer;
+	float: right;
+	font-weight: 300;
+	font-size: 0.8rem;
+	margin-top: 1.5rem;
+	outline: none;
+	text-transform: uppercase;
+	padding: 0.5rem 1rem;
+	font-weight: bold;
+}
+
+
+/**
+ * Media Queries
+ */
+
+@media screen and (max-width: 40em) {
+	main .container {
+		width: 90%;
+		max-width: 90%;
+		margin: auto;
+		padding: 1rem;
+	}
+}
+
+h1, h2 {
+	text-align: c;
+	margin: 1rem 0;
+}
+h1 {
+	color: #aaa;
+	font-size: 1.6rem;
+	font-weight: normal;
+}
+h2 {
+	color: #aaa;
+	font-size: 1rem;
+	font-weight: normal;
+}
+p {
+	color: #333;
+	font-size: 1.2rem;
+	text-align: left;
+}
+p.subscript {
+	color: #666;
+	font-size: 0.7rem;
+}
+
+		</style>
+		<title>Maintenance</title>
+		<meta charset="UTF-8"> 
+	</head>
+
+	<body>
+	
+		<main>
+			
+			<div class="container">
+				
+				<h1>${title}</h1>
+				<p>${description}</p>
+				<p class="subscript">${subscript}</p>
+
+			</div>
+
+		</main>
+		
+	</body>
+</html>
