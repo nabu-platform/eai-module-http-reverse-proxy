@@ -82,7 +82,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private volatile PlannedDowntime planned = null;
 	private Map<String, String> downtimeContent = new HashMap<String, String>();
 	private ExecutorService ioExecutors, processExecutors;
-	private boolean useSharedPools = Boolean.parseBoolean(System.getProperty("reverseProxy.sharePools", "false"));
+	private boolean useSharedPools = Boolean.parseBoolean(System.getProperty("reverseProxy.sharePools", "true"));
 	
 	public ReverseProxy(String id, ResourceContainer<?> directory, Repository repository) {
 		super(id, directory, repository, "reverse-proxy.xml", ReverseProxyConfiguration.class);
@@ -122,7 +122,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		// this can prevent the need for jwt-based sessions
 		if (getConfig().getEntries() != null) {
 			if (useSharedPools) {
-				int ioPoolSize = getConfig().getIoPoolSize() == null ? new Integer(System.getProperty("reverseProxy.ioPoolSize", "50")) : getConfig().getIoPoolSize();
+				int ioPoolSize = getConfig().getIoPoolSize() == null ? new Integer(System.getProperty("reverseProxy.ioPoolSize", "25")) : getConfig().getIoPoolSize();
 				int processPoolSize = getConfig().getProcessPoolSize() == null ? new Integer(System.getProperty("reverseProxy.processPoolSize", "25")) : getConfig().getProcessPoolSize();
 				ioExecutors = Executors.newFixedThreadPool(ioPoolSize, getThreadFactory());
 				processExecutors = Executors.newFixedThreadPool(processPoolSize, getThreadFactory());
