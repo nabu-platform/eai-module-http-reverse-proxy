@@ -14,7 +14,10 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
@@ -78,6 +81,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private Logger logger = LoggerFactory.getLogger(getClass());
 	private volatile PlannedDowntime planned = null;
 	private Map<String, String> downtimeContent = new HashMap<String, String>();
+	private ExecutorService ioExecutors, processExecutors;
+	private boolean useSharedPools = Boolean.parseBoolean(System.getProperty("reverseProxy.sharePools", "false"));
 	
 	public ReverseProxy(String id, ResourceContainer<?> directory, Repository repository) {
 		super(id, directory, repository, "reverse-proxy.xml", ReverseProxyConfiguration.class);
@@ -85,10 +90,30 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 
 	@Override
 	public void stop() throws IOException {
+		if (useSharedPools) {
+			if (ioExecutors != null) {
+				ioExecutors.shutdown();
+			}
+			if (processExecutors != null) {
+				processExecutors.shutdown();
+			}
+		}
 		for (EventSubscription<?, ?> subscription : subscriptions) {
 			subscription.unsubscribe();
 		}
 		subscriptions.clear();
+	}
+	
+	private ThreadFactory getThreadFactory() {
+		final RepositoryThreadFactory threadFactory = new RepositoryThreadFactory(getRepository());
+		return new ThreadFactory() {
+			@Override
+			public Thread newThread(Runnable r) {
+				Thread thread = threadFactory.newThread(r);
+				thread.setDaemon(true);
+				return thread;
+			}
+		};
 	}
 
 	@Override
@@ -96,11 +121,17 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		// need to redirect same ip to same server (for optimal cache reusage etc), this also provides more or less sticky sessions if necessary
 		// this can prevent the need for jwt-based sessions
 		if (getConfig().getEntries() != null) {
+			if (useSharedPools) {
+				int ioPoolSize = getConfig().getIoPoolSize() == null ? new Integer(System.getProperty("reverseProxy.ioPoolSize", "50")) : getConfig().getIoPoolSize();
+				int processPoolSize = getConfig().getProcessPoolSize() == null ? new Integer(System.getProperty("reverseProxy.processPoolSize", "25")) : getConfig().getProcessPoolSize();
+				ioExecutors = Executors.newFixedThreadPool(ioPoolSize, getThreadFactory());
+				processExecutors = Executors.newFixedThreadPool(processPoolSize, getThreadFactory());
+			}
 			for (final ReverseProxyEntry entry : getConfig().getEntries()) {
 				if (entry.getHost() != null && entry.getCluster() != null) {
 					
 					// make sure we listen to disconnects from the server so we can close outstanding clients
-					entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
+					subscriptions.add(entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
 						@Override
 						public Void handle(ConnectionEvent event) {
 //							logger.info("[" + event.getState() + "] --SERVER-- event: " + event.getPipeline() + " from " + event.getPipeline().getSourceContext().getSocketAddress() + " -> " + (event.getPipeline().getContext().get(REVERSE_PROXY_CLIENT) != null));
@@ -118,7 +149,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							}
 							return null;
 						}
-					});
+					}));
 					
 					final EventDispatcher dispatcher = getRepository().getComplexEventDispatcher();
 					
@@ -206,34 +237,42 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 										}
 									}
 								}
-								client = new NIOHTTPClientImpl(null, 3, 1, 1, 
-									new EventDispatcherImpl(), 
-									new MemoryMessageDataProvider(), 
-									new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE), 
-									new RepositoryThreadFactory(getRepository()));
+								if (useSharedPools) {
+									client = new NIOHTTPClientImpl(null, ioExecutors, processExecutors, 1, 
+										new EventDispatcherImpl(), 
+										new MemoryMessageDataProvider(), 
+										new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE));
+								}
+								else {
+									client = new NIOHTTPClientImpl(null, 3, 1, 1, 
+										new EventDispatcherImpl(), 
+										new MemoryMessageDataProvider(), 
+										new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE), 
+										new RepositoryThreadFactory(getRepository()));
+								}
 								pipeline.getContext().put(REVERSE_PROXY_CLIENT, client);
 
-								client.getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
-									@Override
-									public Void handle(ConnectionEvent event) {
-										// we can't close the pipeline itself immediately because the answer that triggered the close (e.g. a 500) might still need to be fed back to the client
-										// we can't even check if the pipeline responses are empty because there is a time gap between the last pop and it actually being done
-										// it seems too hard to predict when the offending message is on the pipeline here
-										// note that this does seem to solve the connection timeout problem, so better reenable if we don't find another solution
-										/*if (event.getState() == ConnectionState.CLOSED) {
-											try {
-												MessagePipelineImpl<?, ?> cast = (MessagePipelineImpl<?, ?>) pipeline;
-												// always set it to drain
-												cast.drain();
-											}
-											catch (Exception e) {
-												logger.warn("Could not close server pipeline after client connection failed", e);
-											}
-										}*/
-//										logger.info("[" + event.getState() + "] --CLIENT-- event: " + ((MessagePipelineImpl) event.getPipeline()).getSelectionKey().channel() + " -> " + ((MessagePipelineImpl) event.getPipeline()).getSelectionKey().channel().hashCode() + " FROM " + finalC.getNIOClient().hashCode());
-										return null;
-									}
-								});
+//								client.getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
+//									@Override
+//									public Void handle(ConnectionEvent event) {
+//										// we can't close the pipeline itself immediately because the answer that triggered the close (e.g. a 500) might still need to be fed back to the client
+//										// we can't even check if the pipeline responses are empty because there is a time gap between the last pop and it actually being done
+//										// it seems too hard to predict when the offending message is on the pipeline here
+//										// note that this does seem to solve the connection timeout problem, so better reenable if we don't find another solution
+//										/*if (event.getState() == ConnectionState.CLOSED) {
+//											try {
+//												MessagePipelineImpl<?, ?> cast = (MessagePipelineImpl<?, ?>) pipeline;
+//												// always set it to drain
+//												cast.drain();
+//											}
+//											catch (Exception e) {
+//												logger.warn("Could not close server pipeline after client connection failed", e);
+//											}
+//										}*/
+////										logger.info("[" + event.getState() + "] --CLIENT-- event: " + ((MessagePipelineImpl) event.getPipeline()).getSelectionKey().channel() + " -> " + ((MessagePipelineImpl) event.getPipeline()).getSelectionKey().channel().hashCode() + " FROM " + finalC.getNIOClient().hashCode());
+//										return null;
+//									}
+//								});
 
 //								client.setAmountOfRetries(2);
 								

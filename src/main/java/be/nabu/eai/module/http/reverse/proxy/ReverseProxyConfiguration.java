@@ -16,6 +16,7 @@ public class ReverseProxyConfiguration {
 
 	private List<ReverseProxyEntry> entries;
 	private Long timeout; 
+	private Integer ioPoolSize, processPoolSize;
 	
 	public List<ReverseProxyEntry> getEntries() {
 		return entries;
@@ -29,6 +30,19 @@ public class ReverseProxyConfiguration {
 	}
 	public void setTimeout(Long timeout) {
 		this.timeout = timeout;
+	}
+
+	public Integer getIoPoolSize() {
+		return ioPoolSize;
+	}
+	public void setIoPoolSize(Integer ioPoolSize) {
+		this.ioPoolSize = ioPoolSize;
+	}
+	public Integer getProcessPoolSize() {
+		return processPoolSize;
+	}
+	public void setProcessPoolSize(Integer processPoolSize) {
+		this.processPoolSize = processPoolSize;
 	}
 
 	public static class ReverseProxyEntry {
