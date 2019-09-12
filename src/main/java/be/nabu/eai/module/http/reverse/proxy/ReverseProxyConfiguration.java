@@ -49,6 +49,7 @@ public class ReverseProxyConfiguration {
 		private VirtualHostArtifact host;
 		private ClusterArtifact cluster;
 		private List<DowntimePage> downtimePages;
+		private boolean enableWebsockets;
 	
 		@NotNull
 		@XmlJavaTypeAdapter(value = ArtifactXMLAdapter.class)
@@ -73,6 +74,12 @@ public class ReverseProxyConfiguration {
 		}
 		public void setDowntimePages(List<DowntimePage> downtimePages) {
 			this.downtimePages = downtimePages;
+		}
+		public boolean isEnableWebsockets() {
+			return enableWebsockets;
+		}
+		public void setEnableWebsockets(boolean enableWebsockets) {
+			this.enableWebsockets = enableWebsockets;
 		}
 	}
 	

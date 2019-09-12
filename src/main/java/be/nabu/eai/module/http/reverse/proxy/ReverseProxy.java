@@ -2,7 +2,6 @@ package be.nabu.eai.module.http.reverse.proxy;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.UnsupportedEncodingException;
 import java.net.CookieManager;
 import java.net.CookiePolicy;
 import java.net.Inet6Address;
@@ -23,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import be.nabu.eai.developer.MainController;
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.DowntimePage;
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.ReverseProxyEntry;
 import be.nabu.eai.repository.EAIRepositoryUtils;
@@ -45,28 +45,27 @@ import be.nabu.libs.http.core.CustomCookieStore;
 import be.nabu.libs.http.core.DefaultHTTPResponse;
 import be.nabu.libs.http.core.HTTPUtils;
 import be.nabu.libs.http.core.ServerHeader;
+import be.nabu.libs.http.server.nio.HTTPResponseFormatter;
 import be.nabu.libs.http.server.nio.MemoryMessageDataProvider;
+import be.nabu.libs.http.server.websockets.WebSocketUtils;
+import be.nabu.libs.http.server.websockets.api.WebSocketMessage;
+import be.nabu.libs.http.server.websockets.api.WebSocketRequest;
+import be.nabu.libs.http.server.websockets.client.ClientWebSocketUpgradeHandler;
 import be.nabu.libs.nio.PipelineUtils;
+import be.nabu.libs.nio.api.MessagePipeline;
 import be.nabu.libs.nio.api.Pipeline;
+import be.nabu.libs.nio.api.StandardizedMessagePipeline;
 import be.nabu.libs.nio.api.events.ConnectionEvent;
 import be.nabu.libs.nio.api.events.ConnectionEvent.ConnectionState;
-import be.nabu.libs.nio.impl.MessagePipelineImpl;
 import be.nabu.libs.nio.impl.NIOFixedConnector;
-import be.nabu.libs.resources.ResourceFactory;
 import be.nabu.libs.resources.ResourceUtils;
-import be.nabu.libs.resources.api.ReadableResource;
-import be.nabu.libs.resources.api.Resource;
 import be.nabu.libs.resources.api.ResourceContainer;
-import be.nabu.libs.services.api.ServiceException;
-import be.nabu.libs.validator.api.ValidationMessage.Severity;
 import be.nabu.utils.cep.api.EventSeverity;
 import be.nabu.utils.cep.impl.HTTPComplexEventImpl;
 import be.nabu.utils.io.IOUtils;
 import be.nabu.utils.io.api.ByteBuffer;
 import be.nabu.utils.io.api.ReadableContainer;
-import be.nabu.utils.mime.api.ContentPart;
 import be.nabu.utils.mime.api.Header;
-import be.nabu.utils.mime.api.ModifiablePart;
 import be.nabu.utils.mime.impl.FormatException;
 import be.nabu.utils.mime.impl.MimeHeader;
 import be.nabu.utils.mime.impl.MimeUtils;
@@ -153,6 +152,39 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 					
 					final EventDispatcher dispatcher = getRepository().getComplexEventDispatcher();
 					
+					final boolean enableWebsockets = entry.isEnableWebsockets();
+					if (enableWebsockets) {
+						// if we get a request, push it to the client and on to the server
+						entry.getHost().getDispatcher().subscribe(WebSocketRequest.class, new EventHandler<WebSocketRequest, WebSocketMessage>() {
+							@Override
+							public WebSocketMessage handle(WebSocketRequest event) {
+//								System.out.println("--------------> sending websocket request from source client to target server: " + event.getPath() + " / " + event.getOpCode() + " / " + event.isMasked());
+								Pipeline pipeline = PipelineUtils.getPipeline();
+								// there _has_ to be a client as we can only have a websocket connection after upgrading a http connection
+								NIOHTTPClientImpl client = (NIOHTTPClientImpl) pipeline.getContext().get(REVERSE_PROXY_CLIENT);
+//								System.out.println("--------------> sending websocket request from source client to target server (client) " + client);
+								if (client != null) {
+									List<StandardizedMessagePipeline<WebSocketRequest, WebSocketMessage>> pipelines = WebSocketUtils.getWebsocketPipelines(client.getNIOClient(), null);
+									if (pipelines != null && pipelines.size() > 0) {
+										pipelines.get(0).getResponseQueue().add(event);
+									}
+									else {
+										logger.warn("Could not send websocket message because no appropriate connections were found");
+										try {
+											pipeline.close();
+										}
+										catch (IOException e) {
+											// ignore?
+										}
+									}
+								}
+								return null;
+							}
+						});
+						// upgrade the incoming server pipeline if an upgrade is mandated from the receiving server
+						entry.getHost().getDispatcher().subscribe(HTTPResponse.class, new ClientWebSocketUpgradeHandler(new MemoryMessageDataProvider(1024 * 1024 * 5), false, entry.getHost().getDispatcher()));
+					}
+					
 					EventSubscription<HTTPRequest, HTTPResponse> subscription = entry.getHost().getDispatcher().subscribe(HTTPRequest.class, new EventHandler<HTTPRequest, HTTPResponse>() {
 						@Override
 						public HTTPResponse handle(HTTPRequest event) {
@@ -214,6 +246,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							}
 							
 							NIOHTTPClientImpl client = (NIOHTTPClientImpl) pipeline.getContext().get(REVERSE_PROXY_CLIENT);
+							
 							// if we don't have a client or it is no longer running, start a new one
 							if (client == null || !client.getNIOClient().isStarted()) {
 								if (remoteHost == null) {
@@ -241,7 +274,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									client = new NIOHTTPClientImpl(null, ioExecutors, processExecutors, 1, 
 										new EventDispatcherImpl(), 
 										new MemoryMessageDataProvider(), 
-										new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE));
+										new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE),
+										HTTPResponseFormatter.STREAMING_MODE);
 								}
 								else {
 									client = new NIOHTTPClientImpl(null, 3, 1, 1, 
@@ -251,6 +285,36 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 										new RepositoryThreadFactory(getRepository()));
 								}
 								pipeline.getContext().put(REVERSE_PROXY_CLIENT, client);
+								
+								if (enableWebsockets) {
+									// capped at 5mb
+									WebSocketUtils.allowWebsockets(client, new MemoryMessageDataProvider(1024 * 1024 * 5));
+									final NIOHTTPClientImpl finalClient = client;
+									// push responses to the original server
+									client.getDispatcher().subscribe(WebSocketRequest.class, new EventHandler<WebSocketRequest, WebSocketMessage>() {
+										// the pipeline we have before this one is by definition the http pipeline, not the upgraded websocket pipeline
+										// we can only find it after the upgrade but the upgrade happens in a post processing step, so always after this runs
+										// we can however find the correct pipeline by looking through the server pipelines
+										private volatile Pipeline websocketPipeline;
+										@SuppressWarnings("unchecked")
+										@Override
+										public WebSocketMessage handle(WebSocketRequest event) {
+//											System.out.println("--------------> sending websocket request back from the target server: " + event.getPath() + " / " + event.getOpCode());
+											((MessagePipeline<WebSocketRequest, WebSocketMessage>) getPipeline()).getResponseQueue().add(event);
+											return null;
+										}
+										private Pipeline getPipeline() {
+											for (Pipeline potential : new ArrayList<Pipeline>(pipeline.getServer().getPipelines())) {
+												Object object = potential.getContext().get(REVERSE_PROXY_CLIENT);
+												if (finalClient.equals(object)) {
+													this.websocketPipeline = potential;
+													break;
+												}
+											}
+											return this.websocketPipeline;
+										}
+									});
+								}
 
 //								client.getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
 //									@Override
