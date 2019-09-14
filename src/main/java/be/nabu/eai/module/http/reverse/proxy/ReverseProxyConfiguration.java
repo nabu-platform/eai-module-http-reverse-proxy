@@ -50,6 +50,7 @@ public class ReverseProxyConfiguration {
 		private ClusterArtifact cluster;
 		private List<DowntimePage> downtimePages;
 		private boolean enableWebsockets;
+		private String path;
 	
 		@NotNull
 		@XmlJavaTypeAdapter(value = ArtifactXMLAdapter.class)
@@ -80,6 +81,12 @@ public class ReverseProxyConfiguration {
 		}
 		public void setEnableWebsockets(boolean enableWebsockets) {
 			this.enableWebsockets = enableWebsockets;
+		}
+		public String getPath() {
+			return path;
+		}
+		public void setPath(String path) {
+			this.path = path;
 		}
 	}
 	

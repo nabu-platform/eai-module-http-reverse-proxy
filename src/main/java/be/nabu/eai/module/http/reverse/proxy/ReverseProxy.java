@@ -22,7 +22,6 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import be.nabu.eai.developer.MainController;
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.DowntimePage;
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.ReverseProxyEntry;
 import be.nabu.eai.repository.EAIRepositoryUtils;
@@ -42,15 +41,18 @@ import be.nabu.libs.http.api.HTTPRequest;
 import be.nabu.libs.http.api.HTTPResponse;
 import be.nabu.libs.http.client.nio.NIOHTTPClientImpl;
 import be.nabu.libs.http.core.CustomCookieStore;
+import be.nabu.libs.http.core.DefaultHTTPRequest;
 import be.nabu.libs.http.core.DefaultHTTPResponse;
 import be.nabu.libs.http.core.HTTPUtils;
 import be.nabu.libs.http.core.ServerHeader;
+import be.nabu.libs.http.server.HTTPServerUtils;
 import be.nabu.libs.http.server.nio.HTTPResponseFormatter;
 import be.nabu.libs.http.server.nio.MemoryMessageDataProvider;
 import be.nabu.libs.http.server.websockets.WebSocketUtils;
 import be.nabu.libs.http.server.websockets.api.WebSocketMessage;
 import be.nabu.libs.http.server.websockets.api.WebSocketRequest;
 import be.nabu.libs.http.server.websockets.client.ClientWebSocketUpgradeHandler;
+import be.nabu.libs.http.server.websockets.util.PathFilter;
 import be.nabu.libs.nio.PipelineUtils;
 import be.nabu.libs.nio.api.MessagePipeline;
 import be.nabu.libs.nio.api.Pipeline;
@@ -130,7 +132,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 				if (entry.getHost() != null && entry.getCluster() != null) {
 					
 					// make sure we listen to disconnects from the server so we can close outstanding clients
-					subscriptions.add(entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
+					EventSubscription<ConnectionEvent, Void> closeSubscription = entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
 						@Override
 						public Void handle(ConnectionEvent event) {
 //							logger.info("[" + event.getState() + "] --SERVER-- event: " + event.getPipeline() + " from " + event.getPipeline().getSourceContext().getSocketAddress() + " -> " + (event.getPipeline().getContext().get(REVERSE_PROXY_CLIENT) != null));
@@ -148,14 +150,15 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							}
 							return null;
 						}
-					}));
+					});
+					subscriptions.add(closeSubscription);
 					
 					final EventDispatcher dispatcher = getRepository().getComplexEventDispatcher();
 					
 					final boolean enableWebsockets = entry.isEnableWebsockets();
 					if (enableWebsockets) {
 						// if we get a request, push it to the client and on to the server
-						entry.getHost().getDispatcher().subscribe(WebSocketRequest.class, new EventHandler<WebSocketRequest, WebSocketMessage>() {
+						EventSubscription<WebSocketRequest, WebSocketMessage> websocketSubscription = entry.getHost().getDispatcher().subscribe(WebSocketRequest.class, new EventHandler<WebSocketRequest, WebSocketMessage>() {
 							@Override
 							public WebSocketMessage handle(WebSocketRequest event) {
 //								System.out.println("--------------> sending websocket request from source client to target server: " + event.getPath() + " / " + event.getOpCode() + " / " + event.isMasked());
@@ -181,8 +184,16 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								return null;
 							}
 						});
+						if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
+							websocketSubscription.filter(new PathFilter(entry.getPath(), false, true));
+						}
+						subscriptions.add(websocketSubscription);
 						// upgrade the incoming server pipeline if an upgrade is mandated from the receiving server
-						entry.getHost().getDispatcher().subscribe(HTTPResponse.class, new ClientWebSocketUpgradeHandler(new MemoryMessageDataProvider(1024 * 1024 * 5), false, entry.getHost().getDispatcher()));
+						EventSubscription<HTTPResponse, HTTPRequest> upgradeSubscriber = entry.getHost().getDispatcher().subscribe(HTTPResponse.class, new ClientWebSocketUpgradeHandler(new MemoryMessageDataProvider(1024 * 1024 * 5), false, entry.getHost().getDispatcher()));
+						if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
+							upgradeSubscriber.filter(HTTPServerUtils.limitToRequestPath(entry.getPath(), false));
+						}
+						subscriptions.add(upgradeSubscriber);
 					}
 					
 					EventSubscription<HTTPRequest, HTTPResponse> subscription = entry.getHost().getDispatcher().subscribe(HTTPRequest.class, new EventHandler<HTTPRequest, HTTPResponse>() {
@@ -365,6 +376,28 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							}
 							
 							try {
+								// if we have an incoming path, we need to rewrite it
+								if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
+									String target = event.getTarget();
+									// relative target
+									if (target.startsWith(entry.getPath())) {
+										target = target.substring(entry.getPath().length());
+										if (!target.startsWith("/")) {
+											target = "/" + target;
+										}
+									}
+									// absolute target presumably?
+									else {
+										URI uri = HTTPUtils.getURI(event, false);
+										String substring = uri.getPath().substring(entry.getPath().length());
+										if (!substring.startsWith("/")) {
+											substring = "/" + substring;
+										}
+										uri = new URI(uri.getScheme(), uri.getAuthority(), substring, uri.getQuery(), uri.getFragment());
+										target = uri.toString();
+									}
+									event = new DefaultHTTPRequest(event.getMethod(), target, event.getContent(), event.getVersion());
+								}
 								Future<HTTPResponse> call = client.call(event, false);
 								long timeout = getConfig().getTimeout() != null ? getConfig().getTimeout() : 30 * 60000;
 								HTTPResponse httpResponse = call.get(timeout, TimeUnit.MILLISECONDS);
@@ -418,6 +451,9 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							}
 						}
 					});
+					if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
+						subscription.filter(HTTPServerUtils.limitToPath(entry.getPath(), false));
+					}
 					subscriptions.add(subscription);
 				}
 			}
