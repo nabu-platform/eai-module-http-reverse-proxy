@@ -129,7 +129,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 				processExecutors = Executors.newFixedThreadPool(processPoolSize, getThreadFactory());
 			}
 			for (final ReverseProxyEntry entry : getConfig().getEntries()) {
-				if (entry.getHost() != null && entry.getCluster() != null) {
+				if (entry.getHost() != null && entry.getCluster() != null && entry.getHost().getConfig().getServer() != null) {
 					
 					// make sure we listen to disconnects from the server so we can close outstanding clients
 					EventSubscription<ConnectionEvent, Void> closeSubscription = entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
@@ -242,13 +242,6 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								}
 								catch (FormatException e) {
 									// ignore
-								}
-								for (Header header2 : event.getContent().getHeaders()) {
-									// user agent is saved in a dedicated field
-									if (header2.getName().equalsIgnoreCase("User-Agent")) {
-										continue;
-									}
-									request.getExtensions().put("header:" + header2.getName(), MimeUtils.getFullHeaderValue(header2));
 								}
 							}
 							
@@ -377,11 +370,15 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							
 							try {
 								// if we have an incoming path, we need to rewrite it
-								if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
+								String entryPath = entry.getPath();
+								if (entryPath != null && !entryPath.isEmpty() && !entryPath.equals("/")) {
+									if (!entryPath.startsWith("/")) {
+										entryPath = "/" + entryPath;
+									}
 									String target = event.getTarget();
 									// relative target
-									if (target.startsWith(entry.getPath())) {
-										target = target.substring(entry.getPath().length());
+									if (target.startsWith(entryPath)) {
+										target = target.substring(entryPath.length());
 										if (!target.startsWith("/")) {
 											target = "/" + target;
 										}
@@ -389,7 +386,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									// absolute target presumably?
 									else {
 										URI uri = HTTPUtils.getURI(event, false);
-										String substring = uri.getPath().substring(entry.getPath().length());
+										String substring = uri.getPath().substring(entryPath.length());
 										if (!substring.startsWith("/")) {
 											substring = "/" + substring;
 										}
@@ -405,7 +402,16 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								if (request != null) {
 									request.setStopped(new Date());
 									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
-									request.setSeverity(httpResponse.getCode() >= 403 ? EventSeverity.WARNING : EventSeverity.INFO);
+									if (httpResponse.getCode() < 400) {
+										request.setSeverity(EventSeverity.DEBUG);
+									}
+									// in general this is "expected", a 403 is fishy though
+									else if (httpResponse.getCode() == 401) {
+										request.setSeverity(EventSeverity.DEBUG);
+									}
+									else {
+										request.setSeverity(EventSeverity.WARNING);
+									}
 									request.setResponseCode(httpResponse.getCode());
 									dispatcher.fire(request, ReverseProxy.this);
 								}
