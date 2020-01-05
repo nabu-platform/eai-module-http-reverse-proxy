@@ -395,6 +395,10 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									}
 									event = new DefaultHTTPRequest(event.getMethod(), target, event.getContent(), event.getVersion());
 								}
+								// set the proxy path as a header so we can better generate links
+								if (entry.getPath() != null && !entry.getPath().trim().isEmpty() && !entry.getPath().trim().equals("/")) {
+									event.getContent().setHeader(new MimeHeader(ServerHeader.PROXY_PATH.getName(), entry.getPath()));
+								}
 								Future<HTTPResponse> call = client.call(event, false);
 								long timeout = getConfig().getTimeout() != null ? getConfig().getTimeout() : 30 * 60000;
 								HTTPResponse httpResponse = call.get(timeout, TimeUnit.MILLISECONDS);
