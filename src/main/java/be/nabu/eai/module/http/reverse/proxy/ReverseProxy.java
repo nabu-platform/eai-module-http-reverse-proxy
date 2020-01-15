@@ -61,6 +61,7 @@ import be.nabu.libs.nio.api.events.ConnectionEvent;
 import be.nabu.libs.nio.api.events.ConnectionEvent.ConnectionState;
 import be.nabu.libs.nio.impl.NIOFixedConnector;
 import be.nabu.libs.resources.ResourceUtils;
+import be.nabu.libs.resources.URIUtils;
 import be.nabu.libs.resources.api.ResourceContainer;
 import be.nabu.utils.cep.api.EventSeverity;
 import be.nabu.utils.cep.impl.HTTPComplexEventImpl;
@@ -84,6 +85,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private Map<String, String> downtimeContent = new HashMap<String, String>();
 	private ExecutorService ioExecutors, processExecutors;
 	private boolean useSharedPools = Boolean.parseBoolean(System.getProperty("reverseProxy.sharePools", "true"));
+	private boolean blockDoubleEncoded = Boolean.parseBoolean(System.getProperty("reverseProxy.blockDoubleEncoded", "true"));
 	
 	public ReverseProxy(String id, ResourceContainer<?> directory, Repository repository) {
 		super(id, directory, repository, "reverse-proxy.xml", ReverseProxyConfiguration.class);
@@ -152,6 +154,12 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 						}
 					});
 					subscriptions.add(closeSubscription);
+
+					// normalize the entry path
+					String entryPath = entry.getPath();
+					if (entryPath != null && !entryPath.startsWith("/") && !entryPath.isEmpty()) {
+						entryPath = "/" + entryPath;
+					}
 					
 					final EventDispatcher dispatcher = getRepository().getComplexEventDispatcher();
 					
@@ -184,15 +192,16 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								return null;
 							}
 						});
-						if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
-							websocketSubscription.filter(new PathFilter(entry.getPath(), false, true));
+						if (entryPath != null && !entryPath.isEmpty() && !entryPath.equals("/")) {
+							websocketSubscription.filter(new PathFilter(entryPath, false, true));
 						}
 						subscriptions.add(websocketSubscription);
 						// upgrade the incoming server pipeline if an upgrade is mandated from the receiving server
 						EventSubscription<HTTPResponse, HTTPRequest> upgradeSubscriber = entry.getHost().getDispatcher().subscribe(HTTPResponse.class, new ClientWebSocketUpgradeHandler(new MemoryMessageDataProvider(1024 * 1024 * 5), false, entry.getHost().getDispatcher()));
-						if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
-							upgradeSubscriber.filter(HTTPServerUtils.limitToRequestPath(entry.getPath(), false));
+						if (entryPath != null && !entryPath.isEmpty() && !entryPath.equals("/")) {
+							upgradeSubscriber.filter(HTTPServerUtils.limitToRequestPath(entryPath, false, true, true));
 						}
+//						System.out.println("------------------------> enabled websocket subscription for: " + entryPath + " for host " + entry.getHost().getId());
 						subscriptions.add(upgradeSubscriber);
 					}
 					
@@ -242,6 +251,21 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								}
 								catch (FormatException e) {
 									// ignore
+								}
+							}
+							
+							// this is for safety reasons, there seem to be very few _valid_ reasons for double encoding
+							if (blockDoubleEncoded) {
+								String target = URIUtils.decodeURI(event.getTarget());
+								// halt double encoded targets?
+								if (!target.equals(URIUtils.decodeURI(target))) {
+									request.setStopped(new Date());
+									request.setMessage("Double encoded target detected in reverse proxy");
+									request.setCode("DOUBLE-URI-ENCODED");
+									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
+									request.setSeverity(EventSeverity.WARNING);
+									dispatcher.fire(request, ReverseProxy.this);
+									return null;
 								}
 							}
 							
@@ -370,12 +394,13 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							
 							try {
 								// if we have an incoming path, we need to rewrite it
+								// same normalization as above (this code was first, not retrofitted yet)
 								String entryPath = entry.getPath();
 								if (entryPath != null && !entryPath.isEmpty() && !entryPath.equals("/")) {
 									if (!entryPath.startsWith("/")) {
 										entryPath = "/" + entryPath;
 									}
-									String target = event.getTarget();
+									String target = URIUtils.decodeURI(event.getTarget());
 									// relative target
 									if (target.startsWith(entryPath)) {
 										target = target.substring(entryPath.length());
@@ -396,8 +421,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									event = new DefaultHTTPRequest(event.getMethod(), target, event.getContent(), event.getVersion());
 								}
 								// set the proxy path as a header so we can better generate links
-								if (entry.getPath() != null && !entry.getPath().trim().isEmpty() && !entry.getPath().trim().equals("/")) {
-									event.getContent().setHeader(new MimeHeader(ServerHeader.PROXY_PATH.getName(), entry.getPath()));
+								if (entryPath != null && !entryPath.trim().isEmpty() && !entryPath.trim().equals("/")) {
+									event.getContent().setHeader(new MimeHeader(ServerHeader.PROXY_PATH.getName(), entryPath));
 								}
 								Future<HTTPResponse> call = client.call(event, false);
 								long timeout = getConfig().getTimeout() != null ? getConfig().getTimeout() : 30 * 60000;
@@ -461,8 +486,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							}
 						}
 					});
-					if (entry.getPath() != null && !entry.getPath().isEmpty() && !entry.getPath().equals("/")) {
-						subscription.filter(HTTPServerUtils.limitToPath(entry.getPath(), false));
+					if (entryPath != null && !entryPath.isEmpty() && !entryPath.equals("/")) {
+						subscription.filter(HTTPServerUtils.limitToPath(entryPath, false));
 					}
 					subscriptions.add(subscription);
 				}
