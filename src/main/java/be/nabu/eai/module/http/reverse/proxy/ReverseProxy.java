@@ -36,6 +36,7 @@ import be.nabu.libs.events.api.EventDispatcher;
 import be.nabu.libs.events.api.EventHandler;
 import be.nabu.libs.events.api.EventSubscription;
 import be.nabu.libs.events.impl.EventDispatcherImpl;
+import be.nabu.libs.http.HTTPCodes;
 import be.nabu.libs.http.HTTPException;
 import be.nabu.libs.http.api.HTTPRequest;
 import be.nabu.libs.http.api.HTTPResponse;
@@ -73,6 +74,7 @@ import be.nabu.utils.mime.impl.FormatException;
 import be.nabu.utils.mime.impl.MimeHeader;
 import be.nabu.utils.mime.impl.MimeUtils;
 import be.nabu.utils.mime.impl.PlainMimeContentPart;
+import be.nabu.utils.mime.impl.PlainMimeEmptyPart;
 
 public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implements StartableArtifact, StoppableArtifact {
 
@@ -263,9 +265,11 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									request.setMessage("Double encoded target detected in reverse proxy");
 									request.setCode("DOUBLE-URI-ENCODED");
 									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
-									request.setSeverity(EventSeverity.WARNING);
+									request.setSeverity(EventSeverity.ERROR);
+									request.setResponseCode(400);
 									dispatcher.fire(request, ReverseProxy.this);
-									return null;
+									// don't allow this
+									return new DefaultHTTPResponse(event, 400, HTTPCodes.getMessage(400), new PlainMimeEmptyPart(null, new MimeHeader("Content-Length", "0")));
 								}
 							}
 							
