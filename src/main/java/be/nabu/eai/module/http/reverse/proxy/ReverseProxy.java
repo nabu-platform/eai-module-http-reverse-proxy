@@ -88,6 +88,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private ExecutorService ioExecutors, processExecutors;
 	private boolean useSharedPools = Boolean.parseBoolean(System.getProperty("reverseProxy.sharePools", "true"));
 	private boolean blockDoubleEncoded = Boolean.parseBoolean(System.getProperty("reverseProxy.blockDoubleEncoded", "true"));
+	private boolean replayGet = Boolean.parseBoolean(System.getProperty("reverseProxy.replayGet", "true"));
+	private boolean replayNonGet = Boolean.parseBoolean(System.getProperty("reverseProxy.replayNonGet", "true"));
 	
 	public ReverseProxy(String id, ResourceContainer<?> directory, Repository repository) {
 		super(id, directory, repository, "reverse-proxy.xml", ReverseProxyConfiguration.class);
@@ -474,7 +476,29 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									logger.warn("Could not close client", e1);
 								}
 								pipeline.getContext().remove(REVERSE_PROXY_CLIENT);
-								if (attempt < 2) {
+								// get's are usually safe to replay as they should not cause side effects
+								// by replaying, we can provide a more smooth experience to the end user (e.g. a website fetch that does not fail if a server goes down or a network hiccup occurs)
+								boolean replay = replayGet && "get".equalsIgnoreCase(event.getMethod());
+								// replaying non-gets can get tricky, it will depend in which state the request was at the time of failure
+								// for example if we couldn't connect to the server or couldn't transfer our whole message, replaying is OK
+								// if we could transfer the whole message, the server started processing and suddenly died (without committing), it "can" be ok to replay (depending on how much non-transactional stuff is going on)
+								// if there was only a network error (and not an actual server crash), replaying means the same http message will be sent to the servers twice
+								// this can (and has) resulted in the same message arriving multiple times and getting processed multiple times, these messages can be tracked as they have the same correlation id
+								// the thing is, either the POST (or whatever) can already arrive multiple times, which means a replay is not a problem
+								// _or_ replaying the same message ends in an error, but that means currently play 1 == OK, play 2 = NOK, the remote party only sees NOK
+								// alternative: play 1 ends in a 502 cause the server can't be reached (but it _was_ processed), the remote party tries again and ends up with the same NOK as in the above
+								// so it is hard to win without adding extensive checks, trying to restore connections, checking server health or whatever else you can think off
+								// incident rate is low so it seems acceptable
+								// currently the only numbers available are slightly skewed
+								// http-message-in was _only_ logged in case of error, but because of some retry issues with a third party system luckily a lot of errors were generated
+								// in this particular instance 176297 http-message-in events were logged
+								// if we look at http-message-in events sharing the same correlation id (== replay), we saw 132 in this dataset
+								// of those 127 were from a GET statement and 5 from a non-GET
+								// this yields a general incident rate of 0.074% and specifically for non-GET (most at risk of funky side effects), 0.0028%
+								// this is skewed both ways: messages that were successful at first and failed on the replay will not end up here (count by http-message-in would be one)
+								// but _all_ successful messages don't show up here which massively skews the "total count"
+								replay |= replayNonGet && !"get".equalsIgnoreCase(event.getMethod());
+								if (attempt < 2 && replay) {
 									if (remoteHost == null) {
 										InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
 										remoteHost = socketAddress.getHostString();
