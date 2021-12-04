@@ -224,8 +224,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							if (dispatcher != null) {
 								request = new HTTPComplexEventImpl();
 								request.setArtifactId(getId());
-								request.setEventName("reverse-proxy-request");
-								request.setEventCategory("reverse-proxy");
+								request.setEventName("http-proxy-request");
+								request.setEventCategory("http-message");
 								request.setEventCount(attempt + 1);
 								request.setMethod(event.getMethod());
 								Header header = MimeUtils.getHeader("User-Agent", event.getContent().getHeaders());
@@ -438,11 +438,11 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									request.setStopped(new Date());
 									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
 									if (httpResponse.getCode() < 400) {
-										request.setSeverity(EventSeverity.DEBUG);
+										request.setSeverity(EventSeverity.INFO);
 									}
 									// in general this is "expected", a 403 is fishy though
 									else if (httpResponse.getCode() == 401) {
-										request.setSeverity(EventSeverity.DEBUG);
+										request.setSeverity(EventSeverity.INFO);
 									}
 									else {
 										request.setSeverity(EventSeverity.WARNING);
