@@ -54,9 +54,11 @@ import be.nabu.libs.http.server.websockets.api.WebSocketMessage;
 import be.nabu.libs.http.server.websockets.api.WebSocketRequest;
 import be.nabu.libs.http.server.websockets.client.ClientWebSocketUpgradeHandler;
 import be.nabu.libs.http.server.websockets.util.PathFilter;
+import be.nabu.libs.metrics.api.MetricInstance;
 import be.nabu.libs.nio.PipelineUtils;
 import be.nabu.libs.nio.api.MessagePipeline;
 import be.nabu.libs.nio.api.Pipeline;
+import be.nabu.libs.nio.api.PipelineState;
 import be.nabu.libs.nio.api.StandardizedMessagePipeline;
 import be.nabu.libs.nio.api.events.ConnectionEvent;
 import be.nabu.libs.nio.api.events.ConnectionEvent.ConnectionState;
@@ -76,8 +78,24 @@ import be.nabu.utils.mime.impl.MimeUtils;
 import be.nabu.utils.mime.impl.PlainMimeContentPart;
 import be.nabu.utils.mime.impl.PlainMimeEmptyPart;
 
+/**
+ * IMPORTANT!!
+ * ------------
+ * 
+ * The reverse proxy will do a _synchronous_ get() on the response, this means if the response is slow, the thread will hang.
+ * This does not take up any resources with regards to CPU and very little with regards to memory.
+ * But it _does_ occupy a thread in the server process thread pool.
+ * 
+ * Currently it is unclear if we can easily sidestep the synchronous nature of this call, the responses _have_ to arrive in the same order as the requests.
+ * Otherwise we could step out of the code and periodically check the future for resolution and add it to the target queue, this pipeline is already a particular connection.
+ * Idea: we can offload the checking of the futures to a dedicated process that checks them in order. Futures can only be resolved if every future before it has been resolved. This needs to be capped to prevent memory leaks but other than that it would maintain order.
+ * 
+ * Alternative: we use forkjoin instead of thread pools, allowing for infinite expansion. The only real difference is the overhead of a thread which is negligible so might not be worth the effort.
+ */
 public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implements StartableArtifact, StoppableArtifact {
 
+	private static final String OPEN_HTTP_CLIENTS = "openHttpClients";
+	
 	private static final String REVERSE_PROXY_CLIENT = "reverseProxyClient";
 	private Map<String, String> hostMapping = new HashMap<String, String>();
 	private Map<Cluster, Integer> roundRobin = new HashMap<Cluster, Integer>();
@@ -90,9 +108,12 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private boolean blockDoubleEncoded = Boolean.parseBoolean(System.getProperty("reverseProxy.blockDoubleEncoded", "true"));
 	private boolean replayGet = Boolean.parseBoolean(System.getProperty("reverseProxy.replayGet", "true"));
 	private boolean replayNonGet = Boolean.parseBoolean(System.getProperty("reverseProxy.replayNonGet", "true"));
+
+	private MetricInstance metrics;
 	
 	public ReverseProxy(String id, ResourceContainer<?> directory, Repository repository) {
 		super(id, directory, repository, "reverse-proxy.xml", ReverseProxyConfiguration.class);
+		metrics = repository.getMetricInstance(getId());
 	}
 
 	@Override
@@ -111,12 +132,13 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		subscriptions.clear();
 	}
 	
-	private ThreadFactory getThreadFactory() {
+	private ThreadFactory getThreadFactory(final String name) {
 		final RepositoryThreadFactory threadFactory = new RepositoryThreadFactory(getRepository());
 		return new ThreadFactory() {
 			@Override
 			public Thread newThread(Runnable r) {
 				Thread thread = threadFactory.newThread(r);
+				thread.setName(getId() + "-" + name);
 				thread.setDaemon(true);
 				return thread;
 			}
@@ -131,8 +153,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 			if (useSharedPools) {
 				int ioPoolSize = getConfig().getIoPoolSize() == null ? new Integer(System.getProperty("reverseProxy.ioPoolSize", "25")) : getConfig().getIoPoolSize();
 				int processPoolSize = getConfig().getProcessPoolSize() == null ? new Integer(System.getProperty("reverseProxy.processPoolSize", "25")) : getConfig().getProcessPoolSize();
-				ioExecutors = Executors.newFixedThreadPool(ioPoolSize, getThreadFactory());
-				processExecutors = Executors.newFixedThreadPool(processPoolSize, getThreadFactory());
+				ioExecutors = Executors.newFixedThreadPool(ioPoolSize, getThreadFactory("proxy-shared-io"));
+				processExecutors = Executors.newFixedThreadPool(processPoolSize, getThreadFactory("proxy-shared-process"));
 			}
 			for (final ReverseProxyEntry entry : getConfig().getEntries()) {
 				if (entry.getHost() != null && entry.getCluster() != null && entry.getHost().getConfig().getServer() != null) {
@@ -145,10 +167,13 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 							if (event.getState() == ConnectionState.CLOSED) {
 								NIOHTTPClientImpl client = (NIOHTTPClientImpl) event.getPipeline().getContext().get(REVERSE_PROXY_CLIENT);
 								if (client != null) {
+									if (metrics != null && client.getNIOClient().isStarted()) {
+										metrics.increment(OPEN_HTTP_CLIENTS, -1);
+									}
 									try {
 										client.close();
 									}
-									catch (IOException e) {
+									catch (Exception e) {
 										logger.warn("Could not close http client", e);
 									}
 									event.getPipeline().getContext().remove(REVERSE_PROXY_CLIENT);
@@ -188,8 +213,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 										try {
 											pipeline.close();
 										}
-										catch (IOException e) {
-											// ignore?
+										catch (Exception e) {
+											logger.warn("Could not close pipeline for missing websocket", e);
 										}
 									}
 								}
@@ -217,6 +242,32 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 
 						private HTTPResponse handle(final ReverseProxyEntry entry, HTTPRequest event, int attempt) {
 							final Pipeline pipeline = PipelineUtils.getPipeline();
+							
+							// @2022-02-04
+							// if it is closed, don't attempt anything
+							// this is usually in attempt > 0
+							// we had an issue where we did attempt 1 & 2 but the pipeline was closed
+							// the nio client is closed when the pipeline is closed, so if we continue here in different attempts, we will open new nio http clients
+							// these nio clients will never get closed because we won't emit a new CLOSED event on the pipeline!!
+							// this left open nio clients after a websocket connection was closed (usually 2, sometimes 1)
+							// check the websocket listener for more information as to why that was happening (search: FF00)
+							if (pipeline == null || pipeline.getState() == PipelineState.CLOSED) {
+								NIOHTTPClientImpl client = (NIOHTTPClientImpl) pipeline.getContext().get(REVERSE_PROXY_CLIENT);
+								if (client != null && client.getNIOClient().isStarted()) {
+									try {
+										client.close();
+									}
+									catch (Exception e) {
+										logger.warn("Could not close http client", e);
+									}
+									pipeline.getContext().remove(REVERSE_PROXY_CLIENT);
+									if (metrics != null) {
+										metrics.increment(OPEN_HTTP_CLIENTS, -1);
+									}
+								}
+								logger.warn("Could not handle proxy request, the pipeline (" + pipeline + ") is closed (attempt: " + attempt + ")");
+								return new DefaultHTTPResponse(event,  599, "Pipeline closed", new PlainMimeEmptyPart(null, new MimeHeader("Content-Length", "0")));
+							}
 
 							HTTPComplexEventImpl request = null;
 							String remoteHost = null;
@@ -287,9 +338,11 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									InetSocketAddress socketAddress = (InetSocketAddress) pipeline.getSourceContext().getSocketAddress();
 									remoteHost = socketAddress.getHostString();
 								}
-								if (!hostMapping.containsKey(remoteHost)) {
+								String host = hostMapping.get(remoteHost);
+								if (host == null) {
 									synchronized(hostMapping) {
-										if (!hostMapping.containsKey(remoteHost)) {
+										host = hostMapping.get(remoteHost);
+										if (host == null) {
 											List<ClusterMember> members = entry.getCluster().getMembers();
 											if (members.isEmpty()) {
 												return serverDown(event, entry, request);
@@ -299,7 +352,8 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 											if (robin >= members.size()) {
 												robin = 0;
 											}
-											hostMapping.put(remoteHost, members.get(robin).getAddress().getHostString() + ":" + members.get(robin).getAddress().getPort());
+											host = members.get(robin).getAddress().getHostString() + ":" + members.get(robin).getAddress().getPort();
+											hostMapping.put(remoteHost, host);
 											roundRobin.put(entry.getCluster(), robin);
 										}
 									}
@@ -310,6 +364,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 										new MemoryMessageDataProvider(), 
 										new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE),
 										HTTPResponseFormatter.STREAMING_MODE);
+									client.setName("reverse-proxy-client-" + (remoteHost == null ? "anonymous" : remoteHost));
 								}
 								else {
 									client = new NIOHTTPClientImpl(null, 3, 1, 1, 
@@ -317,6 +372,10 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 										new MemoryMessageDataProvider(), 
 										new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE), 
 										new RepositoryThreadFactory(getRepository()));
+									client.setName("reverse-proxy-client-" + (remoteHost == null ? "anonymous" : remoteHost));
+								}
+								if (metrics != null) {
+									metrics.increment(OPEN_HTTP_CLIENTS, 1);
 								}
 								pipeline.getContext().put(REVERSE_PROXY_CLIENT, client);
 								
@@ -374,7 +433,11 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 
 //								client.setAmountOfRetries(2);
 								
-								String host = hostMapping.get(remoteHost);
+								// @2022-02-21: in some extreme exceptions this is null at this point
+//								String host = hostMapping.get(remoteHost);
+//								if (host == null) {
+//									throw new IllegalStateException("The host is null for remote host " + remoteHost);
+//								}
 								int indexOf = host.indexOf(':');
 								int port = 80;
 								if (indexOf > 0) {
@@ -448,7 +511,11 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 										request.setSeverity(EventSeverity.WARNING);
 									}
 									request.setResponseCode(httpResponse.getCode());
-									dispatcher.fire(request, ReverseProxy.this);
+									// we are already emitting a http-level event from the proxy
+									// we don't need an additional message at this level
+									if (request.getSeverity() == EventSeverity.ERROR) {
+										dispatcher.fire(request, ReverseProxy.this);
+									}
 								}
 								// remove internal headers
 								for (ServerHeader header : ServerHeader.values()) {
@@ -462,6 +529,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								return httpResponse;
 							}
 							catch (Exception e) {
+								logger.warn("Could not process proxy request", e);
 								if (request != null) {
 									request.setStopped(new Date());
 									request.setDuration(request.getStopped().getTime() - request.getStarted().getTime());
@@ -469,10 +537,13 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									EAIRepositoryUtils.enrich(request, e);
 									dispatcher.fire(request, ReverseProxy.this);
 								}
+								if (metrics != null && client.getNIOClient().isStarted()) {
+									metrics.increment(OPEN_HTTP_CLIENTS, -1);
+								}
 								try {
 									client.close();
 								}
-								catch (IOException e1) {
+								catch (Exception e1) {
 									logger.warn("Could not close client", e1);
 								}
 								pipeline.getContext().remove(REVERSE_PROXY_CLIENT);
