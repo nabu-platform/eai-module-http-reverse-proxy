@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.DowntimePage;
 import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.ReverseProxyEntry;
+import be.nabu.eai.module.http.reverse.proxy.ReverseProxyConfiguration.ReverseProxyHeartbeat;
 import be.nabu.eai.repository.EAIRepositoryUtils;
 import be.nabu.eai.repository.RepositoryThreadFactory;
 import be.nabu.eai.repository.api.Repository;
@@ -97,6 +98,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private static final String OPEN_HTTP_CLIENTS = "openHttpClients";
 	
 	private static final String REVERSE_PROXY_CLIENT = "reverseProxyClient";
+	private static final String REVERSE_PROXY_HOST = "reverseProxyHost";
 	private Map<String, String> hostMapping = new HashMap<String, String>();
 	private Map<Cluster, Integer> roundRobin = new HashMap<Cluster, Integer>();
 	private List<EventSubscription<?, ?>> subscriptions = new ArrayList<EventSubscription<?, ?>>();
@@ -108,6 +110,10 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	private boolean blockDoubleEncoded = Boolean.parseBoolean(System.getProperty("reverseProxy.blockDoubleEncoded", "true"));
 	private boolean replayGet = Boolean.parseBoolean(System.getProperty("reverseProxy.replayGet", "true"));
 	private boolean replayNonGet = Boolean.parseBoolean(System.getProperty("reverseProxy.replayNonGet", "true"));
+	
+	// possibly a temporary feature: if the proxy entry has no heartbeat at all, do we still want to add one for the root?
+	private boolean heartbeatRoot = Boolean.parseBoolean(System.getProperty("reverseProxy.heartbeatRoot", "false"));
+	private boolean runHeartbeat = Boolean.parseBoolean(System.getProperty("reverseProxy.heartbeat", "false"));
 
 	private MetricInstance metrics;
 	
@@ -118,6 +124,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 
 	@Override
 	public void stop() throws IOException {
+		heartbeating = false;
 		if (useSharedPools) {
 			if (ioExecutors != null) {
 				ioExecutors.shutdown();
@@ -145,8 +152,161 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		};
 	}
 
+	private boolean heartbeating = false;
+	private Thread heartbeat;
+	
+	private Map<String, NIOHTTPClientImpl> heartbeatClients = new HashMap<String, NIOHTTPClientImpl>();
+	
+	// multiple applications can be hosted on the same server
+	// one server might not respond correctly to one application (like a 404 because of reload issue) but might respond correctly for another
+	private volatile Map<ReverseProxyEntry, List<String>> blacklisted = new HashMap<ReverseProxyEntry, List<String>>();
+	
+	private void runHeartbeat() {
+		if (!heartbeating) {
+			heartbeating = true;
+			heartbeat = new Thread(new Runnable() {
+				@Override
+				public void run() {
+					EventDispatcher dispatcher = getRepository().getComplexEventDispatcher();
+					while (heartbeating) {
+						try {
+							for (final ReverseProxyEntry entry : getConfig().getEntries()) {
+								// for multithreaded reasons, we always start a new list rather than altering the existing
+								List<String> blacklistedMembers = new ArrayList<String>();
+								// and just all the members available
+								List<String> allMembers = new ArrayList<String>();
+								List<ReverseProxyHeartbeat> heartbeats = entry.getHeartbeats();
+								if (heartbeatRoot && (heartbeats == null || heartbeats.isEmpty())) {
+									// always create new list to avoid updating the original list by reference
+									heartbeats = new ArrayList<ReverseProxyHeartbeat>();
+									ReverseProxyHeartbeat heartbeat = new ReverseProxyHeartbeat();
+									heartbeats.add(heartbeat);
+								}
+								else if (heartbeats == null || heartbeats.isEmpty()) {
+									// always create new list to avoid updating the original list by reference
+									heartbeats = new ArrayList<ReverseProxyHeartbeat>();
+									ReverseProxyHeartbeat heartbeat = new ReverseProxyHeartbeat();
+									heartbeat.setPath("/heartbeat");
+									heartbeats.add(heartbeat);
+								}
+								if (heartbeats != null && !heartbeats.isEmpty()) {
+									logger.info("Checking heartbeat for: " + entry.getHost().getConfig().getHost());
+									List<ClusterMember> members = entry.getCluster().getMembers();
+									// keep track of the ones that should be blacklisted
+									for (ReverseProxyHeartbeat heartbeat : heartbeats) {
+										for (ClusterMember member : members) {
+											String host = member.getAddress().getHostString();
+											allMembers.add(host);
+											NIOHTTPClientImpl client = heartbeatClients.get(host);
+											if (client == null) {
+												client = new NIOHTTPClientImpl(null, 3, 1, 1, 
+													new EventDispatcherImpl(), 
+													new MemoryMessageDataProvider(), 
+													new CookieManager(new CustomCookieStore(), CookiePolicy.ACCEPT_NONE), 
+													new RepositoryThreadFactory(getRepository()));
+												client.setName("reverse-proxy-heartbeat-client-" + host);
+												client.getNIOClient().setConnector(new NIOFixedConnector(member.getAddress().getHostString(), member.getAddress().getPort()));
+												heartbeatClients.put(host, client);
+											}
+											String heartbeatHost = heartbeat.getHost();
+											// we use the primary host from our virtual host to make the call
+											if (heartbeatHost == null && entry.getHost() != null) {
+												heartbeatHost = entry.getHost().getConfig().getHost();
+											}
+											if (heartbeatHost == null) {
+												heartbeatHost = host;
+											}
+											HTTPRequest request = new DefaultHTTPRequest("GET", heartbeat.getPath() == null ? "/" : heartbeat.getPath(), new PlainMimeEmptyPart(null,
+												new MimeHeader("Content-Length", "0"),
+												new MimeHeader("Host", heartbeatHost),
+												new MimeHeader("User-Agent", "Nabu-Reverse-Proxy-Heartbeat")));
+											Date started = new Date();
+											HTTPResponse response = null;
+											try {
+												Future<HTTPResponse> call = client.call(request, null, false, true);
+												response = call.get(heartbeat.getMaxTimeout() == null ? 15000l : heartbeat.getMaxTimeout(), TimeUnit.MILLISECONDS);
+												logger.info("Received heartbeat response from " + member.getAddress().getHostString() + " in " + (new Date().getTime() - started.getTime()) + "ms");
+												// only the 200 range is valid for a heartbeat
+												if (response.getCode() < 200 || response.getCode() >= 300) {
+													throw new HTTPException(response.getCode());
+												}
+											}
+											// timeout reached
+											catch (Exception e) {
+												blacklistedMembers.add(host);
+												
+												logger.error("Heartbeat failed for " + member.getAddress().getHostString() + " in " + (new Date().getTime() - started.getTime()) + "ms", e);
+												
+												if (dispatcher != null) {
+													HTTPComplexEventImpl event = new HTTPComplexEventImpl();
+													EAIRepositoryUtils.enrich(event, e);
+													event.setArtifactId(getId());
+													if (response != null) {
+														event.setResponseCode(response.getCode());
+													}
+													event.setEventName(e instanceof InterruptedException ? "http-proxy-heartbeat-timeout" : "http-proxy-heartbeat-error");
+													event.setEventCategory("http-message");
+													event.setMethod("GET");
+													event.setDestinationHost(host);
+													event.setDestinationPort(member.getAddress().getPort());
+													event.setTransportProtocol("TCP");
+													event.setApplicationProtocol("HTTP");
+													event.setStarted(started);
+													event.setStopped(new Date());
+													try {
+														event.setRequestUri(HTTPUtils.getURI(request, false));
+													}
+													catch (FormatException e1) {
+														// ignore
+													}
+													event.setSeverity(EventSeverity.ERROR);
+													if (heartbeat.getName() != null) {
+														event.setCode(heartbeat.getName());
+													}
+													
+													dispatcher.fire(event, ReverseProxy.this);
+												}
+											}
+										}
+										// we might have stopped the heartbeating while we were waiting...
+										// let's stop here then
+										if (!heartbeating) {
+											break;
+										}
+									}
+									logger.info("Heartbeat for '" + entry.getHost().getConfig().getHost() + "': " + blacklistedMembers.size() + "/" + allMembers.size() + " blacklisted" + (blacklistedMembers.size() > 0 ? " (" + blacklistedMembers + ")" : ""));
+								}
+								// if all the members are blacklisted, none of them are
+								// perhaps the servers are still working, just slower and we might prefer a slow application to no application
+								// we could (in the future) opt to show a clean downtime page at that time though it might not be stable (depending on the cause)
+								// for now, we expect people to follow up the events, notice that one or more servers are struggling and take appropriate action
+								if (blacklistedMembers.size() == allMembers.size()) {
+									blacklistedMembers.clear();
+								}
+								blacklisted.put(entry, blacklistedMembers);
+							}
+							// sleep a minute
+							Thread.sleep(60000);
+						}
+						catch (InterruptedException e) {
+							// ignore
+						}
+					}
+					heartbeat = null;
+				}
+			});
+			heartbeat.setName("reverse-proxy-heartbeat-" + getId());
+			heartbeat.setDaemon(true);
+			heartbeat.start();
+		}
+	}
+	
 	@Override
 	public void start() throws IOException {
+		if (runHeartbeat) {
+			runHeartbeat();
+		}
+		
 		// need to redirect same ip to same server (for optimal cache reusage etc), this also provides more or less sticky sessions if necessary
 		// this can prevent the need for jwt-based sessions
 		if (getConfig().getEntries() != null) {
@@ -330,7 +490,32 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								return serverDown(event, entry, request);
 							}
 							
+							List<String> blacklistedClone = new ArrayList<String>();
+							List<String> blacklistedForEntry = blacklisted.get(entry);
+							if (blacklistedForEntry != null) {
+								blacklistedClone.addAll(blacklistedForEntry);
+							}
+							
 							NIOHTTPClientImpl client = (NIOHTTPClientImpl) pipeline.getContext().get(REVERSE_PROXY_CLIENT);
+							
+							// if we have a current client, check that it is not connected to a blacklisted host
+							// blacklisted hosts may no longer be reachable
+							if (client != null) {
+								String currentHost = (String) pipeline.getContext().get(REVERSE_PROXY_HOST);
+								if (currentHost != null && blacklistedClone.indexOf(currentHost) >= 0) {
+									if (metrics != null && client.getNIOClient().isStarted()) {
+										metrics.increment(OPEN_HTTP_CLIENTS, -1);
+									}
+									try {
+										client.close();
+									}
+									catch (Exception e1) {
+										logger.warn("Could not close client", e1);
+									}
+									pipeline.getContext().remove(REVERSE_PROXY_CLIENT);
+									client = null;
+								}
+							}
 							
 							// if we don't have a client or it is no longer running, start a new one
 							if (client == null || !client.getNIOClient().isStarted()) {
@@ -348,16 +533,33 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 												return serverDown(event, entry, request);
 											}
 											int robin = roundRobin.containsKey(entry.getCluster()) ? roundRobin.get(entry.getCluster()) : -1;
-											robin++;
-											if (robin >= members.size()) {
-												robin = 0;
+											int initialRobin = robin;
+											String lastHost = null;
+											// we are picking a host, but some may be blacklisted, keep searching
+											while (host == null && initialRobin != ++robin) {
+												if (robin >= members.size()) {
+													robin = 0;
+												}
+												lastHost = members.get(robin).getAddress().getHostString() + ":" + members.get(robin).getAddress().getPort();
+												if (blacklistedClone.indexOf(members.get(robin).getAddress().getHostString()) < 0) {
+													host = lastHost;
+													hostMapping.put(remoteHost, host);
+													roundRobin.put(entry.getCluster(), robin);
+												}
 											}
-											host = members.get(robin).getAddress().getHostString() + ":" + members.get(robin).getAddress().getPort();
-											hostMapping.put(remoteHost, host);
-											roundRobin.put(entry.getCluster(), robin);
+											// if everything is blacklisted (so we complete the round robin), we use the last host
+											if (host == null) {
+												host = lastHost;
+											}
+											if (host == null) {
+												return serverDown(event, entry, request);
+											}
 										}
 									}
 								}
+								// make sure we note the currently chosen host so we can check blacklisting before we start another call
+								pipeline.getContext().put(REVERSE_PROXY_HOST, host.substring(0, host.indexOf(':')));
+								
 								if (useSharedPools) {
 									client = new NIOHTTPClientImpl(null, ioExecutors, processExecutors, 1, 
 										new EventDispatcherImpl(), 
