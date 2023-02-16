@@ -56,6 +56,7 @@ import be.nabu.libs.http.server.websockets.api.WebSocketRequest;
 import be.nabu.libs.http.server.websockets.client.ClientWebSocketUpgradeHandler;
 import be.nabu.libs.http.server.websockets.util.PathFilter;
 import be.nabu.libs.metrics.api.MetricInstance;
+import be.nabu.libs.metrics.api.MetricTimer;
 import be.nabu.libs.nio.PipelineUtils;
 import be.nabu.libs.nio.api.MessagePipeline;
 import be.nabu.libs.nio.api.Pipeline;
@@ -525,6 +526,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								}
 								String host = hostMapping.get(remoteHost);
 								if (host == null) {
+									MetricTimer hostSelectionTimer = metrics == null ? null : metrics.start("hostSelection");
 									synchronized(hostMapping) {
 										host = hostMapping.get(remoteHost);
 										if (host == null) {
@@ -555,6 +557,9 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 												return serverDown(event, entry, request);
 											}
 										}
+									}
+									if (hostSelectionTimer != null) {
+										hostSelectionTimer.stop();
 									}
 								}
 								// make sure we note the currently chosen host so we can check blacklisting before we start another call
@@ -695,9 +700,15 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								if (entryPath != null && !entryPath.trim().isEmpty() && !entryPath.trim().equals("/")) {
 									event.getContent().setHeader(new MimeHeader(ServerHeader.PROXY_PATH.getName(), entryPath));
 								}
+								
+								MetricTimer requestExecutionTimer = metrics == null ? null : metrics.start("requestExecutionTime");
 								Future<HTTPResponse> call = client.call(event, false);
 								long timeout = getConfig().getTimeout() != null ? getConfig().getTimeout() : 30 * 60000;
 								HTTPResponse httpResponse = call.get(timeout, TimeUnit.MILLISECONDS);
+								
+								if (requestExecutionTimer != null) {
+									requestExecutionTimer.stop();
+								}
 								
 								if (request != null) {
 									request.setStopped(new Date());
