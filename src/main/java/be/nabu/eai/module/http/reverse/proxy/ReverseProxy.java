@@ -702,6 +702,15 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								}
 								
 								MetricTimer requestExecutionTimer = metrics == null ? null : metrics.start("requestExecutionTime");
+								
+								// @2023-03-17: make sure we don't include a content-length header if we are using chunked encoding
+								// the content-length is likely calculated by ourselves on the _raw_ content (so without the chunk wrappers themselves) which is incorrect!
+								Header transferEncoding = MimeUtils.getHeader("Transfer-Encoding", event.getContent().getHeaders());
+								// make sure we remove the content-length header if chunked is set
+								if (transferEncoding != null && transferEncoding.getValue().equalsIgnoreCase("chunked")) {
+									event.getContent().removeHeader("Content-Length");
+								}
+								
 								Future<HTTPResponse> call = client.call(event, false);
 								long timeout = getConfig().getTimeout() != null ? getConfig().getTimeout() : 30 * 60000;
 								HTTPResponse httpResponse = call.get(timeout, TimeUnit.MILLISECONDS);
@@ -734,7 +743,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 								for (ServerHeader header : ServerHeader.values()) {
 									httpResponse.getContent().removeHeader(header.getName());
 								}
-								Header transferEncoding = MimeUtils.getHeader("Transfer-Encoding", httpResponse.getContent().getHeaders());
+								transferEncoding = MimeUtils.getHeader("Transfer-Encoding", httpResponse.getContent().getHeaders());
 								// make sure we remove the content-length header if chunked is set
 								if (transferEncoding != null && transferEncoding.getValue().equalsIgnoreCase("chunked")) {
 									httpResponse.getContent().removeHeader("Content-Length");
