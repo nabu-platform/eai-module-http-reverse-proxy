@@ -81,6 +81,10 @@ import be.nabu.utils.mime.impl.PlainMimeContentPart;
 import be.nabu.utils.mime.impl.PlainMimeEmptyPart;
 
 /**
+ * TODO:
+ * The blacklist logic currently has a list of blacklisted and "all" members, but every member can be added multiple times depending on the amount of actualy heartbeats being run
+ * because the amount is currently always 1, it "works", but it is likely not correct
+ * 
  * IMPORTANT!!
  * ------------
  * 
@@ -318,10 +322,10 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 				processExecutors = Executors.newFixedThreadPool(processPoolSize, getThreadFactory("proxy-shared-process"));
 			}
 			for (final ReverseProxyEntry entry : getConfig().getEntries()) {
-				if (entry.getHost() != null && entry.getCluster() != null && entry.getHost().getConfig().getServer() != null) {
+				if (entry.getHost() != null && entry.getCluster() != null && entry.getHost().getServer() != null) {
 					
 					// make sure we listen to disconnects from the server so we can close outstanding clients
-					EventSubscription<ConnectionEvent, Void> closeSubscription = entry.getHost().getConfig().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
+					EventSubscription<ConnectionEvent, Void> closeSubscription = entry.getHost().getServer().getServer().getDispatcher().subscribe(ConnectionEvent.class, new EventHandler<ConnectionEvent, Void>() {
 						@Override
 						public Void handle(ConnectionEvent event) {
 //							logger.info("[" + event.getState() + "] --SERVER-- event: " + event.getPipeline() + " from " + event.getPipeline().getSourceContext().getSocketAddress() + " -> " + (event.getPipeline().getContext().get(REVERSE_PROXY_CLIENT) != null));
@@ -459,11 +463,11 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 									request.setNetworkProtocol("ipv4");
 								}
 								request.setTransportProtocol("TCP");
-								request.setApplicationProtocol(entry.getHost().getConfig().getServer().isSecure() ? "HTTPS" : "HTTP");
+								request.setApplicationProtocol(entry.getHost().getServer().isSecure() ? "HTTPS" : "HTTP");
 								request.setSizeIn(MimeUtils.getContentLength(event.getContent().getHeaders()));
 								request.setStarted(new Date());
 								try {
-									request.setRequestUri(HTTPUtils.getURI(event, entry.getHost().getConfig().getServer().isSecure()));
+									request.setRequestUri(HTTPUtils.getURI(event, entry.getHost().getServer().isSecure()));
 								}
 								catch (FormatException e) {
 									// ignore
@@ -915,7 +919,7 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 		byte[] bytes = contentToSend.getBytes(Charset.forName("UTF-8"));
 		if (event != null) {
 			try {
-				event.setRequestUri(HTTPUtils.getURI(request, entry.getHost().getConfig().getServer().isSecure()));
+				event.setRequestUri(HTTPUtils.getURI(request, entry.getHost().getServer().isSecure()));
 			}
 			catch (Exception e) {
 				// ignore
