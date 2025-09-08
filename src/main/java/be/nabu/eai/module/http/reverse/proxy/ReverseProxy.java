@@ -839,32 +839,52 @@ public class ReverseProxy extends JAXBArtifact<ReverseProxyConfiguration> implem
 	
 	private String getForLanguage(ReverseProxyEntry entry, String language, String cleanedUp) {
 		if (entry.getDowntimePages() != null) {
+			DowntimePage defaultPage = null;
 			// browser language
 			for (DowntimePage page : entry.getDowntimePages()) {
-				if (page != null) {
+				if (page != null && page.getUri() != null) {
 					if (page.getLanguage() != null && (page.getLanguage().equals(language) || page.getLanguage().equals(cleanedUp))) {
 						return readPage(page.getUri());
 					}
+					if (page.getLanguage() == null) {
+						defaultPage = page;
+					}
 				}
+			}
+			// if we did not find a language specific match, check if there is a default
+			if (defaultPage != null) {
+				return readPage(defaultPage.getUri());
 			}
 		}
 		return null;
 	}
+	
+	private Map<URI, String> cachedPages = new HashMap<URI, String>();
 
 	private String readPage(URI uri) {
-		try {
-			ReadableContainer<ByteBuffer> readableContainer = ResourceUtils.toReadableContainer(uri, null);
-			try {
-				return new String(IOUtils.toBytes(readableContainer), "UTF-8");
-			}
-			finally {
-				readableContainer.close();
+		String content = cachedPages.get(uri);
+		if (content == null) {
+			synchronized(cachedPages) {
+				content = cachedPages.get(uri);
+				if (content == null) {
+					try {
+						ReadableContainer<ByteBuffer> readableContainer = ResourceUtils.toReadableContainer(uri, null);
+						try {
+							content = new String(IOUtils.toBytes(readableContainer), "UTF-8");
+							cachedPages.put(uri, content);
+						}
+						finally {
+							readableContainer.close();
+						}
+					}
+					catch (Exception e) {
+						logger.warn("Could not resolve downtime page", e);
+						return null;
+					}
+				}
 			}
 		}
-		catch (Exception e) {
-			logger.warn("Could not resolve downtime page", e);
-			return null;
-		}
+		return content;
 	}
 	
 	private HTTPResponse serverDown(HTTPRequest request, ReverseProxyEntry entry, HTTPComplexEventImpl event) {
